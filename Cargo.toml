@@ -1,0 +1,26 @@
+[package]
+name = "unitalg"
+version = "0.1.0"
+description = "Unit algebra engine: arithmetic, expansion, factoring, conversion, and dimension checking over mathcore-units UnitExpression values"
+readme = "README.md"
+repository = "https://github.com/ChrisGVE/unitalg"
+documentation = "https://docs.rs/unitalg"
+homepage = "https://github.com/ChrisGVE/unitalg"
+keywords = ["units", "dimensional-analysis", "conversion", "algebra", "physics"]
+categories = ["mathematics", "science", "no-std"]
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mathcore-units = { workspace = true }
+serde = { workspace = true, optional = true }
+
+[features]
+default = ["std"]
+std = ["mathcore-units/std"]
+serde = ["dep:serde", "mathcore-units/serde"]
+
+[dev-dependencies]
+serde_json = { workspace = true }

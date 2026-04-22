@@ -1,0 +1,10 @@
+/target
+Cargo.lock
+**/*.rs.bk
+*.swp
+*.swo
+.DS_Store
+
+# Crate-local CLAUDE.md (crate-specific instructions kept local per open-source convention)
+CLAUDE.md
+CLAUDE.local.md
