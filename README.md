@@ -1,4 +1,4 @@
-# unitalg
+# mathcore-unitalg
 
 Unit algebra engine for the mathcore/thales ecosystem.
 
