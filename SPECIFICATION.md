@@ -206,6 +206,23 @@ pub enum ParseError {
         prefix: SiPrefix,
         unit: UnitId,
     },
+    /// An operator that is syntactically invalid in a unit expression
+    /// (e.g., `+`, `-`, `log`, `sin`) was encountered at the given
+    /// byte position in the input string.
+    InvalidOperator {
+        pos: usize,
+        found: char,
+    },
+    /// A `(` was opened but never closed, or a `)` appeared without a
+    /// matching `(`. `pos` is the byte offset of the offending
+    /// parenthesis.
+    UnmatchedParen { pos: usize },
+    /// An exponent was found that is neither an integer literal nor a
+    /// parenthesised rational `(num/den)`. `pos` is the byte offset of
+    /// the `^` operator that introduced the exponent.
+    InvalidExponent { pos: usize },
+    /// The input string was empty or contained only whitespace.
+    EmptyExpression,
 }
 ```
 
@@ -650,6 +667,99 @@ to `mathcore_units::alias::lookup_alias` and
 collision-resolution rules from § 6.3 of mathcore-units. Full algorithm
 in § 6.
 
+### 3.14 `parse_unit_expression`
+
+```rust
+/// Parse a composite unit expression string into a UnitExpression tree.
+///
+/// Accepts inputs like:
+///     "m/s"
+///     "kg·m²/s²"       (Unicode middle-dot as multiplication)
+///     "kg*m^2/s^2"     (ASCII asterisk + caret)
+///     "N·m"
+///     "W/(m²·K⁴)"
+///     "m^(1/2)"        (rational exponent)
+///     "dB"             (bare logarithmic unit)
+///
+/// Grammar (restricted arithmetic subset per mathcore-units § 2.8 UnitExpression):
+///     unit_expr   := term (('*' | '·' | ' ' | '/') term)*
+///     term        := atom ('^' exponent)?
+///     atom        := TOKEN | '(' unit_expr ')'
+///     exponent    := INTEGER | '(' INTEGER '/' INTEGER ')'
+///     TOKEN       := symbols resolved via parse_token
+///
+/// Multiplication operators accepted (all equivalent):
+///     '*'  ASCII asterisk
+///     '·'  U+00B7 middle dot
+///     ' '  whitespace between tokens (implicit multiplication)
+///
+/// Division is '/'. Parentheses allowed for grouping.
+/// Exponentiation '^' takes integer or rational (num/den).
+/// Unicode superscripts (²³⁴) accepted as syntactic sugar for ^2, ^3, ^4.
+///
+/// Operators NOT accepted (rejected with ParseError):
+///     '+', '-'    (unit addition is dimension-unification, not syntax)
+///     'log', 'ln', 'exp'  (these are operators on UnitExpression tree,
+///                           not surface syntax — user can't write
+///                           "log(m)" as a unit)
+///     'sin', 'cos', ...   (transcendentals never on units)
+///
+/// Returns a UnitExpression that is:
+///     - NOT canonicalized (factor/expand are explicit follow-up calls)
+///     - Semantically equivalent to the input string's composition
+///
+/// Collision resolution for individual tokens follows parse_token rules
+/// (mathcore-units § 6.3).
+pub fn parse_unit_expression(s: &str) -> Result<UnitExpression, ParseError>;
+```
+
+**Implementation note:** `parse_unit_expression` is layered directly on
+top of `parse_token`. Each atomic piece of the input (an uninterrupted
+run of non-operator, non-parenthesis characters after stripping Unicode
+superscripts) is passed to `parse_token`, which enforces alias lookup
+and collision resolution. The composite parser is responsible only for
+the grammar level: it tokenizes operators and parentheses, resolves
+exponent syntax, and assembles the resulting `UnitExpression` tree via
+`Binary { Mul | Div | Pow, … }` nodes. This separation ensures that
+adding a new unit alias to the catalog or updating a collision-resolution
+rule automatically propagates to `parse_unit_expression` with no further
+changes.
+
+**Worked examples:**
+
+```
+parse_unit_expression("m/s")
+  → Binary(Div, Atom(Meter), Atom(Second))
+
+parse_unit_expression("kg·m²/s²")
+  → Binary(
+      Div,
+      Binary(Mul, Atom(Kilogram), Binary(Pow, Atom(Meter), Literal(2))),
+      Binary(Pow, Atom(Second), Literal(2))
+    )
+
+parse_unit_expression("W/(m²·K⁴)")
+  → Binary(
+      Div,
+      Atom(Watt),
+      Binary(Mul,
+        Binary(Pow, Atom(Meter), Literal(2)),
+        Binary(Pow, Atom(Kelvin), Literal(4))
+      )
+    )
+```
+
+**Error cases:**
+
+```
+parse_unit_expression("")          → Err(ParseError::EmptyExpression)
+parse_unit_expression("  ")       → Err(ParseError::EmptyExpression)
+parse_unit_expression("m+s")      → Err(ParseError::InvalidOperator { pos: 1, found: '+' })
+parse_unit_expression("m/s)")     → Err(ParseError::UnmatchedParen { pos: 3 })
+parse_unit_expression("m^1.5")    → Err(ParseError::InvalidExponent { pos: 1 })
+parse_unit_expression("unkn")     → Err(ParseError::UnknownToken("unkn".to_owned()))
+```
+
 ---
 
 ## 4. Algorithms
@@ -897,11 +1007,21 @@ Meter.system = SI ≠ Imperial → Err(TargetSystemIncompatible { Imperial, Mete
 
 ### 6.1 Overview
 
-`parse_token` is the sole public entry for converting a string to a
-`UnitExpression`. It delegates to `mathcore_units` alias and prefix
-tables but enforces collision-resolution rules centrally.
+unitalg exposes two public parsing entry points:
 
-### 6.2 Algorithm
+- `parse_token` — converts a **single atomic token** (e.g., `"km"`,
+  `"kg"`, `"Hz"`) to a `UnitExpression`. This is the foundation layer.
+- `parse_unit_expression` — parses a **composite unit string** (e.g.,
+  `"m/s"`, `"kg·m²/s²"`, `"W/(m²·K⁴)"`) by tokenizing operators and
+  parentheses, then calling `parse_token` on each atomic piece. This
+  is the entry point for mathlex consumers.
+
+Both delegate to `mathcore_units` alias and prefix tables but enforce
+collision-resolution rules centrally. `parse_unit_expression` reuses
+`parse_token` entirely for atom resolution; it adds no independent
+alias logic.
+
+### 6.2 `parse_token` algorithm
 
 ```
 fn parse_token(s: &str) -> Result<UnitExpression, ParseError> {
@@ -980,6 +1100,78 @@ After resolving `(prefix, id)`, `parse_token` checks the catalog's
   prefixes (Centi, Deci, Deca, Hecto) → `Err(ParseError::PrefixNotAllowed)`.
 - `None` → any prefix → `Err(ParseError::PrefixNotAllowed)`.
 - `Binary` → not used in v0.x; no binary prefixes accepted.
+
+### 6.5 `parse_unit_expression` algorithm
+
+```
+fn parse_unit_expression(s: &str) -> Result<UnitExpression, ParseError> {
+    // Step 1: reject empty / whitespace-only input
+    if s.trim().is_empty() {
+        return Err(ParseError::EmptyExpression);
+    }
+
+    // Step 2: scan for additive operators and transcendental keywords —
+    // rejected immediately before any recursive descent
+    for (pos, ch) in s.char_indices() {
+        if ch == '+' || ch == '-' {
+            return Err(ParseError::InvalidOperator { pos, found: ch });
+        }
+    }
+    for kw in ["log", "ln", "exp", "sin", "cos", "tan"] {
+        if s.contains(kw) {
+            // Find position of first char of keyword
+            let pos = s.find(kw).unwrap();
+            return Err(ParseError::InvalidOperator {
+                pos,
+                found: s[pos..].chars().next().unwrap(),
+            });
+        }
+    }
+
+    // Step 3: recursive descent per grammar (§ 3.14)
+    //   unit_expr := term (('*' | '·' | ' ' | '/') term)*
+    parse_unit_expr_inner(s.trim())
+}
+
+// Recursive descent helpers (internal):
+//
+//   parse_unit_expr_inner(s) → splits on top-level '*', '·', ' ', '/'
+//     while respecting parenthesis depth; builds Binary { Mul | Div } nodes.
+//
+//   parse_term(s) → splits on '^'; calls parse_atom for the base,
+//     then parse_exponent for the exponent. Normalises Unicode superscripts
+//     (², ³, ⁴, etc.) to their integer values before calling parse_atom.
+//
+//   parse_atom(s) → if surrounded by matching '(' ')': recurse via
+//     parse_unit_expr_inner on the inner slice; otherwise call parse_token(s).
+//
+//   parse_exponent(s) → if s is a bare INTEGER: return Literal(n);
+//     if s matches '(' INTEGER '/' INTEGER ')': return
+//       Binary { Pow, Literal(num), Literal(den) } (rational exponent);
+//     otherwise return Err(ParseError::InvalidExponent { pos }).
+//
+// Parenthesis balance is checked at each level; an unmatched '(' or ')'
+// returns Err(ParseError::UnmatchedParen { pos }).
+```
+
+Superscript normalisation table used by `parse_term`:
+
+| Character | Unicode | Normalised integer |
+|---|---|---|
+| `²` | U+00B2 | 2 |
+| `³` | U+00B3 | 3 |
+| `⁴` | U+2074 | 4 |
+| `⁵` | U+2075 | 5 |
+| `⁶` | U+2076 | 6 |
+| `⁷` | U+2077 | 7 |
+| `⁸` | U+2078 | 8 |
+| `⁹` | U+2079 | 9 |
+| `⁰` | U+2070 | 0 |
+| `¹` | U+00B9 | 1 |
+| `⁻` | U+207B | negates following digit |
+
+Negative superscripts (`⁻¹`, `⁻²`) are supported: `⁻` followed by a
+superscript digit produces the corresponding negative integer exponent.
 
 ---
 
@@ -1238,6 +1430,91 @@ assert!(check_transcendental_argument(&Literal(Rational::ONE)).is_ok());
 - `FromConstant` conversion: `convert(x, SolarMass, Kilogram)` emits
   `Mul(x, Variable("M_sun"))`.
 
+### 10.8 `parse_unit_expression` tests
+
+Tests live in `tests/parse_unit_expression.rs`.
+
+**Positive cases — tree shape:**
+
+```rust
+// m/s → Div(Meter, Second)
+assert_eq!(
+    parse_unit_expression("m/s").unwrap(),
+    Binary(Div, Atom(Meter), Atom(Second))
+);
+
+// kg·m²/s² — Unicode middle-dot and superscripts
+assert_eq!(
+    parse_unit_expression("kg·m²/s²").unwrap(),
+    Binary(Div,
+        Binary(Mul, Atom(Kilogram), Binary(Pow, Atom(Meter), Literal(2))),
+        Binary(Pow, Atom(Second), Literal(2)))
+);
+
+// ASCII asterisk and caret equivalent to Unicode forms
+assert_eq!(
+    parse_unit_expression("kg*m^2/s^2").unwrap(),
+    parse_unit_expression("kg·m²/s²").unwrap()
+);
+
+// Parenthesised denominator: W/(m²·K⁴)
+assert_eq!(
+    parse_unit_expression("W/(m²·K⁴)").unwrap(),
+    Binary(Div,
+        Atom(Watt),
+        Binary(Mul,
+            Binary(Pow, Atom(Meter), Literal(2)),
+            Binary(Pow, Atom(Kelvin), Literal(4))))
+);
+
+// Rational exponent: m^(1/2)
+assert_eq!(
+    parse_unit_expression("m^(1/2)").unwrap(),
+    Binary(Pow, Atom(Meter), Binary(Div, Literal(1), Literal(2)))
+);
+
+// Bare single token passes through parse_token unchanged
+assert_eq!(
+    parse_unit_expression("dB").unwrap(),
+    parse_token("dB").unwrap()
+);
+
+// Implicit multiplication by whitespace: "kg m" == "kg*m"
+assert_eq!(
+    parse_unit_expression("kg m").unwrap(),
+    parse_unit_expression("kg*m").unwrap()
+);
+```
+
+**Error cases:**
+
+```rust
+assert_eq!(parse_unit_expression("").unwrap_err(),    ParseError::EmptyExpression);
+assert_eq!(parse_unit_expression("   ").unwrap_err(), ParseError::EmptyExpression);
+assert!(matches!(
+    parse_unit_expression("m+s").unwrap_err(),
+    ParseError::InvalidOperator { found: '+', .. }
+));
+assert!(matches!(
+    parse_unit_expression("m/s)").unwrap_err(),
+    ParseError::UnmatchedParen { .. }
+));
+assert!(matches!(
+    parse_unit_expression("m^1.5").unwrap_err(),
+    ParseError::InvalidExponent { .. }
+));
+// Unknown token propagated from parse_token
+assert!(matches!(
+    parse_unit_expression("unkn").unwrap_err(),
+    ParseError::UnknownToken(_)
+));
+```
+
+**Collision resolution propagation:** `parse_unit_expression("TT/s")`
+must resolve `TT` as `(Tera, Tesla)` via `parse_token`, consistent
+with § 6.3 collision table. Test uses the same expected output as the
+`parse_token` collision audit.
+
 ---
 
 ## 11. Crate layout
@@ -1258,7 +1535,7 @@ unitalg/
 │   ├── convert.rs                   # convert, conversion emission
 │   ├── system.rs                    # choose_system, SysError
 │   ├── check.rs                     # is_compatible, check_transcendental_argument
-│   ├── parse.rs                     # parse_token, RESERVED_TOKENS
+│   ├── parse.rs                     # parse_token, parse_unit_expression, RESERVED_TOKENS
 │   ├── constants.rs                 # constant_symbol mapping table (§ 8.2)
 │   └── error.rs                     # DimError, ConvError, SysError, ArgError, ParseError
 └── tests/
@@ -1268,6 +1545,7 @@ unitalg/
     ├── dimension_arithmetic.rs      # sanity checks on dim_add/sub/scale
     ├── convert.rs                   # emission correctness (linear, affine, log, const)
     ├── transcendental.rs            # check_transcendental_argument
+    ├── parse_unit_expression.rs     # parse_unit_expression positive + error cases (§ 10.8)
     └── system_selection.rs          # choose_system worked examples
 ```
 
@@ -1318,6 +1596,7 @@ unitalg/
 | UA-23 | Constant symbol mapping table (`ConstantId` → variable string) is static, exhaustive for all `FromConstant` catalog entries, and coordinated with mathlex variable names | Required |
 | UA-24 | `AdditiveResult` serde-capable (opt-in) only when both mathlex serde and unitalg serde features are enabled | Optional |
 | UA-25 | Wire format for error enums uses `#[serde(tag = "kind", content = "value")]` consistent with mathcore-units | Required |
+| UA-26 | `parse_unit_expression(s)` parses composite unit strings (`m/s`, `kg·m²/s²`, `W/(m²·K⁴)`) via the grammar in § 3.14, layered on `parse_token`; Unicode middle-dot (`·`) and ASCII asterisk (`*`) are interchangeable multiplication operators; implicit multiplication by whitespace is accepted; Unicode superscript digits (`²³⁴⁵⁶⁷⁸⁹`) are accepted as sugar for integer exponents; additive operators (`+`, `-`) and transcendental keywords (`log`, `ln`, `exp`, `sin`, `cos`, `tan`) are rejected with `ParseError::InvalidOperator`; unmatched parentheses return `ParseError::UnmatchedParen`; non-integer non-rational exponents return `ParseError::InvalidExponent`; empty or whitespace-only input returns `ParseError::EmptyExpression` | Blocker |
 
 ---
 
@@ -1386,6 +1665,18 @@ Decisions confirmed during spec drafting (2026-04-22):
     only path to floating-point is via mathlex-eval or thales's
     numerical evaluation passes. This is consistent with thales Rule 5
     (zero technical debt) and with the alloc-only target.
+
+11. **MI-ISSUE-1 resolved: composite unit parsing via `parse_unit_expression`.**
+    The mathlex integration spec identified that `parse_token` only handles
+    single-atom tokens (`km`, `kg`, `Hz`) and is therefore insufficient for
+    consumers that need to parse composite unit strings such as `m/s`,
+    `kg·m²/s²`, and `W/(m²·K⁴)`. The resolution is the new public function
+    `parse_unit_expression` (§ 3.14), which adds a grammar layer on top of
+    `parse_token`. Individual atoms continue to route through `parse_token`
+    so collision-resolution rules and prefix-admissibility enforcement are
+    inherited automatically. No changes to `parse_token` are required.
+    Requirement UA-26 captures this contract; tests live in
+    `tests/parse_unit_expression.rs` (§ 10.8).
 
 ---
 
